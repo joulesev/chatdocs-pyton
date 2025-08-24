@@ -1,211 +1,145 @@
-# app.py
+# app.py (versión modificada)
 
 import os
-import json
-import re
+import io
 import streamlit as st
 import google.generativeai as genai
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaIoBaseDownload
+from pypdf import PdfReader
 
-# --- Configuración de la Página y Título ---
-st.set_page_config(
-    page_title="Chat con Documentación",
-    page_icon="🤖",
-    layout="wide"
-)
+# --- Configuración de la Página ---
+st.set_page_config(page_title="Chat con Google Drive", page_icon="📄", layout="wide")
+st.title("📄 Chat con Documentos de Google Drive")
 
-st.title("🤖 Chat con Documentación usando Gemini")
-st.caption("Selecciona un grupo de documentos en la barra lateral y haz preguntas sobre ellos.")
-
-# --- Constantes y Datos Iniciales (como en el código TSX) ---
-GEMINI_DOCS_URLS = [
-    "https://ai.google.dev/gemini-api/docs",
-    "https://ai.google.dev/gemini-api/docs/quickstart",
-    "https://ai.google.dev/gemini-api/docs/models",
-    "https://ai.google.dev/gemini-api/docs/pricing",
-]
-
-MODEL_CAPABILITIES_URLS = [
-    "https://ai.google.dev/gemini-api/docs/text-generation",
-    "https://ai.google.dev/gemini-api/docs/image-generation",
-    "https://ai.google.dev/gemini-api/docs/function-calling",
-    "https://ai.google.dev/gemini-api/docs/grounding",
-]
-
-INITIAL_URL_GROUPS = {
-    'gemini-overview': {'name': 'Gemini Docs Overview', 'urls': GEMINI_DOCS_URLS},
-    'model-capabilities': {'name': 'Model Capabilities', 'urls': MODEL_CAPABILITIES_URLS},
-}
-
-# --- Configuración de la API de Gemini ---
-# NOTA DE SEGURIDAD: Usamos st.secrets para el despliegue en Streamlit Community Cloud.
+# --- Configuración de APIs y credenciales ---
+# Carga de secretos
 try:
-    api_key = st.secrets["GEMINI_API_KEY"]
-    genai.configure(api_key=api_key)
-    API_KEY_CONFIGURED = True
+    gcp_credentials_dict = st.secrets["gcp_service_account"]
+    drive_folder_id = st.secrets["DRIVE_FOLDER_ID"]
+    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+    SECRETS_CONFIGURED = True
 except (KeyError, FileNotFoundError):
-    API_KEY_CONFIGURED = False
-    st.error("🚨 Error: La API Key de Gemini no está configurada.")
-    st.warning("Para usar la app, configura tu API Key como un 'Secret' en Streamlit Community Cloud con el nombre `GEMINI_API_KEY`.")
+    st.error("🚨 Error: Faltan secretos en la configuración (Gemini API Key, GCP Service Account o Drive Folder ID).")
+    SECRETS_CONFIGURED = False
 
-# Modelo generativo de Gemini
-model = genai.GenerativeModel('gemini-1.5-flash')
+# --- Funciones para Google Drive ---
 
-# --- Funciones de Lógica de la Aplicación (equivalente a geminiService) ---
-
-def get_initial_suggestions(urls: list[str]) -> list[str]:
-    """Genera sugerencias de preguntas iniciales basadas en las URLs."""
-    if not urls:
-        return []
-    
-    prompt = f"""
-    Basado en el contenido potencial de las siguientes URLs, genera una lista de 3 preguntas interesantes y concisas que un usuario podría hacer.
-    URLs: {', '.join(urls)}
-    
-    Devuelve SOLAMENTE un objeto JSON con una clave "suggestions" que contenga una lista de strings.
-    Ejemplo de formato:
-    ```json
-    {{
-      "suggestions": [
-        "¿Cuáles son los modelos de Gemini disponibles?",
-        "¿Cómo funciona el grounding?",
-        "Explica los precios de la API."
-      ]
-    }}
-    ```
-    """
+# Usamos cache para no reconectar en cada rerun
+@st.cache_resource
+def connect_to_google_drive():
+    """Crea y devuelve un objeto de servicio para interactuar con la API de Drive."""
     try:
-        response = model.generate_content(prompt)
-        # Limpiar la respuesta para extraer solo el JSON (como en el código TSX)
-        json_match = re.search(r'```json\s*([\s\S]*?)\s*```', response.text)
-        if json_match:
-            json_str = json_match.group(1)
-            data = json.loads(json_str)
-            return data.get("suggestions", [])
-        return []
+        creds = Credentials.from_service_account_info(
+            gcp_credentials_dict,
+            scopes=['https://www.googleapis.com/auth/drive.readonly']
+        )
+        service = build('drive', 'v3', credentials=creds)
+        return service
     except Exception as e:
-        print(f"Error generando sugerencias: {e}")
-        return []
+        st.error(f"No se pudo conectar a Google Drive: {e}")
+        return None
 
-def generate_response(query: str, urls: list[str]) -> str:
-    """Genera una respuesta del chat usando el contexto de las URLs."""
+# Usamos cache para no descargar los archivos en cada interacción del usuario
+@st.cache_data(ttl=600) # Cache por 10 minutos
+def get_drive_files_content(_service, folder_id):
+    """Lee el contenido de los archivos (PDF, TXT) de una carpeta de Drive."""
+    if not _service:
+        return None, []
+
+    content_list = []
+    file_names = []
+    try:
+        query = f"'{folder_id}' in parents and trashed=false"
+        results = _service.files().list(q=query, fields="nextPageToken, files(id, name, mimeType)").execute()
+        items = results.get('files', [])
+
+        for item in items:
+            file_id = item['id']
+            file_name = item['name']
+            mime_type = item['mimeType']
+
+            request = _service.files().get_media(fileId=file_id)
+            file_buffer = io.BytesIO()
+            downloader = MediaIoBaseDownload(file_buffer, request)
+            done = False
+            while done is False:
+                status, done = downloader.next_chunk()
+
+            file_buffer.seek(0)
+            file_names.append(file_name)
+
+            if mime_type == 'application/pdf':
+                reader = PdfReader(file_buffer)
+                text = "".join(page.extract_text() for page in reader.pages)
+                content_list.append(f"--- Contenido de '{file_name}' ---\n{text}\n")
+            elif mime_type == 'text/plain':
+                text = file_buffer.read().decode('utf-8')
+                content_list.append(f"--- Contenido de '{file_name}' ---\n{text}\n")
+
+        return "\n".join(content_list), file_names
+    except HttpError as error:
+        st.error(f"Ocurrió un error al acceder a los archivos de Drive: {error}")
+        return None, []
+
+# --- Funciones de Gemini (Modificadas) ---
+def generate_response(query: str, context: str):
+    model = genai.GenerativeModel('gemini-1.5-flash')
     prompt = f"""
-    Eres un asistente experto en la documentación de Google.
-    Usando el contenido de las siguientes URLs como contexto principal, responde la pregunta del usuario.
+    Eres un asistente experto en la documentación proporcionada.
+    Usando el siguiente contexto extraído de varios documentos, responde la pregunta del usuario.
     Si la respuesta no se encuentra en el contexto, indícalo.
-    
-    Contexto de URLs:
-    {', '.join(urls)}
-    
+
+    Contexto:
+    {context}
+
     Pregunta del usuario:
     "{query}"
-    
+
     Respuesta:
     """
-    try:
-        response = model.generate_content(prompt)
-        return response.text
-    except Exception as e:
-        return f"Error al generar la respuesta: {e}"
+    response = model.generate_content(prompt)
+    return response.text
 
+# --- Flujo Principal de la App ---
+if SECRETS_CONFIGURED:
+    drive_service = connect_to_google_drive()
 
-# --- Estado de la Sesión (equivalente a useState) ---
-# Usamos st.session_state para mantener el estado entre interacciones del usuario.
+    with st.spinner("Cargando documentos desde Google Drive..."):
+        document_context, file_names = get_drive_files_content(drive_service, drive_folder_id)
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "active_group_id" not in st.session_state:
-    st.session_state.active_group_id = list(INITIAL_URL_GROUPS.keys())[0]
-if "suggestions" not in st.session_state:
-    st.session_state.suggestions = []
-if "last_fetched_group_id" not in st.session_state:
-    st.session_state.last_fetched_group_id = None
+    if document_context:
+        st.sidebar.header("📄 Archivos en la Base de Conocimiento")
+        st.sidebar.info(f"Se cargaron {len(file_names)} archivo(s) desde Google Drive:")
+        for name in file_names:
+            st.sidebar.markdown(f"- `{name}`")
 
-# --- Barra Lateral (KnowledgeBaseManager) ---
-with st.sidebar:
-    st.header("📚 Base de Conocimiento")
-    
-    # Selector para el grupo de URLs
-    group_options = {id: data['name'] for id, data in INITIAL_URL_GROUPS.items()}
-    selected_group_id = st.radio(
-        "Selecciona un grupo de documentos:",
-        options=group_options.keys(),
-        format_func=lambda id: group_options[id],
-        key='active_group_id' # Vinculamos el radio button al estado de sesión
-    )
-    
-    active_group_name = INITIAL_URL_GROUPS[st.session_state.active_group_id]['name']
-    st.write(f"**Grupo Activo:** {active_group_name}")
-    
-    # Mostrar las URLs del grupo activo
-    with st.expander("Ver URLs del grupo"):
-        urls_in_group = INITIAL_URL_GROUPS[st.session_state.active_group_id]['urls']
-        for url in urls_in_group:
-            st.markdown(f"- `{url}`")
+        # Inicializar historial de chat
+        if "messages" not in st.session_state:
+            st.session_state.messages = [{
+                "role": "assistant",
+                "content": "¡Hola! He cargado los documentos de tu carpeta de Drive. ¿Qué te gustaría saber?"
+            }]
 
-# --- Lógica Principal ---
+        # Mostrar mensajes
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
 
-# Detectar si el grupo de URLs ha cambiado para resetear el chat y las sugerencias
-if st.session_state.active_group_id != st.session_state.last_fetched_group_id:
-    st.session_state.messages = [{
-        "role": "assistant",
-        "content": f"¡Hola! Ahora estás chateando con la documentación de '{active_group_name}'. ¿En qué puedo ayudarte?"
-    }]
-    st.session_state.suggestions = [] # Limpiar sugerencias viejas
-    st.session_state.last_fetched_group_id = st.session_state.active_group_id
-    # Forzar un rerun para que las sugerencias se carguen
-    st.rerun()
+        # Input del usuario
+        if prompt := st.chat_input("Haz una pregunta sobre tus documentos..."):
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
 
-# Cargar sugerencias si no existen para el grupo actual
-if not st.session_state.suggestions and API_KEY_CONFIGURED:
-    with st.spinner("Generando sugerencias..."):
-        current_urls = INITIAL_URL_GROUPS[st.session_state.active_group_id]['urls']
-        st.session_state.suggestions = get_initial_suggestions(current_urls)
-        # Forzar un rerun para mostrar las sugerencias
-        st.rerun()
+            with st.chat_message("assistant"):
+                with st.spinner("Pensando..."):
+                    response = generate_response(prompt, document_context)
+                    st.markdown(response)
 
-# --- Interfaz de Chat (ChatInterface) ---
-
-# Mostrar mensajes existentes
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-
-# Mostrar sugerencias como botones clickables
-if st.session_state.suggestions and len(st.session_state.messages) <= 1:
-    cols = st.columns(len(st.session_state.suggestions))
-    for i, suggestion in enumerate(st.session_state.suggestions):
-        with cols[i]:
-            if st.button(suggestion, key=f"suggestion_{i}"):
-                # Al hacer clic, se usará este texto como prompt
-                user_prompt = suggestion
-                st.session_state.suggestions = [] # Ocultar sugerencias
-                break
+            st.session_state.messages.append({"role": "assistant", "content": response})
     else:
-        user_prompt = None
-else:
-    user_prompt = None
-
-# Input del usuario en el chat
-chat_input_disabled = not API_KEY_CONFIGURED
-if prompt_from_chat := st.chat_input("Haz una pregunta sobre la documentación...", disabled=chat_input_disabled):
-    user_prompt = prompt_from_chat
-
-# Procesar y mostrar la respuesta si hay un nuevo prompt
-if user_prompt:
-    st.session_state.suggestions = [] # Ocultar sugerencias después de la primera pregunta
+        st.warning("No se pudo cargar contenido de la carpeta de Google Drive o la carpeta está vacía.")
     
-    # Añadir mensaje del usuario al historial y mostrarlo
-    st.session_state.messages.append({"role": "user", "content": user_prompt})
-    with st.chat_message("user"):
-        st.markdown(user_prompt)
-        
-    # Generar y mostrar respuesta del asistente
-    with st.chat_message("assistant"):
-        with st.spinner("Pensando..."):
-            current_urls = INITIAL_URL_GROUPS[st.session_state.active_group_id]['urls']
-            response = generate_response(user_prompt, current_urls)
-            st.markdown(response)
-    
-    # Añadir respuesta del asistente al historial
-    st.session_state.messages.append({"role": "assistant", "content": response})
-    st.rerun()
